@@ -1,0 +1,11 @@
+[package]
+name = "bitfront"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Exact global, prefix and suffix Levenshtein scores for byte slices"
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md"]
+
+[dependencies]
+rust-edlib = "=0.3.1"
