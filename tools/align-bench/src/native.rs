@@ -3,14 +3,14 @@ use rust_wfa2::aligner::{AlignmentScope, AlignmentStatus, Heuristics, MemoryMode
 use crate::Mode;
 
 impl Mode {
-    pub(crate) fn rust_edlib(self, query: &[u8], target: &[u8]) -> Option<usize> {
-        match self {
-            Self::Global => rust_edlib::distance(query, target).map(Some),
-            Self::Prefix => rust_edlib::prefix_distance(query, target).map(Some),
-            Self::Suffix => rust_edlib::suffix_distance(query, target).map(Some),
-            Self::AtMost(k) => rust_edlib::align(query, target, &rust_edlib::AlignConfig {
-                max_distance: Some(k), ..Default::default()
-            }).map(|result| result.edit_distance()),
+    pub(crate) fn rust_edlib(self, query: &[u8], target: &[u8], cutoff: Option<usize>) -> Option<usize> {
+        match (self, cutoff) {
+            (Self::Global, None) => rust_edlib::distance(query, target).map(Some),
+            (Self::Global, Some(k)) => rust_edlib::distance_at_most(query, target, k),
+            (Self::Prefix, None) => rust_edlib::prefix_distance(query, target).map(Some),
+            (Self::Prefix, Some(k)) => rust_edlib::prefix_distance_at_most(query, target, k),
+            (Self::Suffix, None) => rust_edlib::suffix_distance(query, target).map(Some),
+            (Self::Suffix, Some(k)) => rust_edlib::suffix_distance_at_most(query, target, k),
         }.expect("rust-edlib failed to score benchmark input")
     }
 }
@@ -18,15 +18,16 @@ impl Mode {
 pub(crate) struct Wfa2 {
     aligner: WFAligner,
     mode: Mode,
+    bounded: bool,
 }
 
 impl Wfa2 {
-    pub(crate) fn new(mode: Mode) -> Self {
+    pub(crate) fn new(mode: Mode, cutoff: Option<usize>) -> Self {
         let builder = WFAligner::builder(AlignmentScope::Score, MemoryModel::MemoryHigh)
             .edit()
             .with_heuristics(Heuristics::none())
             .with_max_num_threads(1);
-        let builder = if let Mode::AtMost(k) = mode {
+        let builder = if let Some(k) = cutoff {
             // The limit is checked after computing a wavefront, but before
             // extending it. Compute k+1 to allow the entire score-k step.
             let max_steps = k
@@ -38,14 +39,15 @@ impl Wfa2 {
             builder
         };
         let mut aligner = builder.build().expect("could not construct WFA2 aligner");
-        if matches!(mode, Mode::AtMost(_)) {
+        let bounded = cutoff.is_some();
+        if bounded {
             // The Rust wrapper snapshots native memory_used even on a step
             // limit. Only normal cleanup initializes that field, so complete
             // a zero-cost alignment here before any timed call can miss.
             let initial = aligner.align_end_to_end(b"A", b"A");
             assert_eq!(initial.status, AlignmentStatus::StatusAlgCompleted);
         }
-        Self { aligner, mode }
+        Self { aligner, mode, bounded }
     }
 
     pub(crate) fn score(&mut self, query: &[u8], target: &[u8]) -> Option<usize> {
@@ -54,7 +56,7 @@ impl Wfa2 {
         // A fresh native call resets the frontiers even after a max-step
         // pause, so keep using the same aligner and its allocated buffers.
         let result = match self.mode {
-            Mode::Global | Mode::AtMost(_) => self.aligner.align_end_to_end(query, target),
+            Mode::Global => self.aligner.align_end_to_end(query, target),
             Mode::Prefix => self.aligner.align_ends_free(query, 0, 0, target, 0, target_len),
             Mode::Suffix => self.aligner.align_ends_free(query, 0, 0, target, target_len, 0),
         };
@@ -64,7 +66,7 @@ impl Wfa2 {
             AlignmentStatus::StatusAlgCompleted => {
                 Some(usize::try_from(result.score).expect("WFA2 returned an invalid distance"))
             }
-            AlignmentStatus::StatusMaxStepsReached if matches!(self.mode, Mode::AtMost(_)) => None,
+            AlignmentStatus::StatusMaxStepsReached if self.bounded => None,
             _ => panic!("WFA2 {:?} failed: {result:?}", self.mode),
         }
     }
@@ -76,7 +78,7 @@ mod tests {
 
     #[test]
     fn bounded_scores_are_inclusive_after_step_limit_misses() {
-        let mut wfa2 = Wfa2::new(Mode::AtMost(1));
+        let mut wfa2 = Wfa2::new(Mode::Global, Some(1));
         let pairs: &[(&[u8], &[u8], Option<usize>)] = &[
             (b"AA", b"CC", None),
             (b"AC", b"AG", Some(1)),
@@ -85,7 +87,7 @@ mod tests {
             (b"TT", b"TT", Some(0)),
         ];
         for &(query, target, expected) in pairs {
-            assert_eq!(Mode::AtMost(1).rust_edlib(query, target), expected);
+            assert_eq!(Mode::Global.rust_edlib(query, target, Some(1)), expected);
             assert_eq!(wfa2.score(query, target), expected);
         }
     }
@@ -93,12 +95,25 @@ mod tests {
     #[test]
     fn anchored_scores_consume_the_query_and_free_only_the_other_end() {
         let query = b"CAG";
-        let target = b"CAGTTT";
-        assert_eq!(Mode::Prefix.rust_edlib(query, target), Some(0));
-        assert_eq!(Wfa2::new(Mode::Prefix).score(query, target), Some(0));
-        assert_eq!(Mode::Suffix.rust_edlib(query, target), Some(3));
-        assert_eq!(Wfa2::new(Mode::Suffix).score(query, target), Some(3));
-        assert_eq!(Mode::Suffix.rust_edlib(query, b"TTTCAG"), Some(0));
-        assert_eq!(Wfa2::new(Mode::Suffix).score(query, b"TTTCAG"), Some(0));
+        for (mode, target, distance) in [
+            (Mode::Prefix, b"CAGTTT", 0),
+            (Mode::Suffix, b"CAGTTT", 3),
+            (Mode::Suffix, b"TTTCAG", 0),
+        ] {
+            assert_eq!(mode.rust_edlib(query, target, None), Some(distance));
+            assert_eq!(Wfa2::new(mode, None).score(query, target), Some(distance));
+        }
+    }
+
+    #[test]
+    fn bounded_anchors_can_hit_at_the_limit_after_a_wrong_end_miss() {
+        let (prefix, suffix) = (b"CATTTT", b"TTTCAT");
+        for (mode, hit, miss) in [(Mode::Prefix, prefix, suffix), (Mode::Suffix, suffix, prefix)] {
+            let mut wfa2 = Wfa2::new(mode, Some(1));
+            for (target, expected) in [(miss, None), (hit, Some(1))] {
+                assert_eq!(mode.rust_edlib(b"CAG", target, Some(1)), expected);
+                assert_eq!(wfa2.score(b"CAG", target), expected);
+            }
+        }
     }
 }

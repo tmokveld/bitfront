@@ -6,7 +6,7 @@ pub(crate) const CAP: usize = 16;
 fn trimmed_window<'q, 't, const REVERSE: bool>(
     query: &'q [u8], target: &'t [u8], k: usize,
 ) -> (&'q [u8], &'t [u8]) {
-    let matched = kernel::extend::<REVERSE>(query, target, 0, 0);
+    let matched = kernel::matching_words::<REVERSE>(query, target);
     let n = query.len() - matched;
     let m = target.len() - matched;
     // Deleting the remaining query costs n. Beyond n + min(k, n) target

@@ -23,16 +23,20 @@ pub use rust_edlib::AlignError as Error;
 /// ```
 pub fn distance(a: &[u8], b: &[u8]) -> Result<usize, Error> {
     let (a, b) = kernel::trim(a, b);
+    if a.is_empty() || b.is_empty() || (a.len() == 1 && b.len() == 1) {
+        // After trimming, two remaining single bytes necessarily differ.
+        return Ok(a.len().max(b.len()));
+    }
     kernel::hybrid(a, b, kernel::cap(a.len(), b.len()))
 }
 
 /// Returns the exact global edit distance if it is at most `k` (inclusive).
-/// `Ok(None)` proves the distance exceeds `k`. Unlike [`distance`], this
-/// search stops at the bound and never restarts an unbounded scorer.
+/// `Ok(None)` proves the distance exceeds `k`. If the trimmed inputs do not
+/// fit the wavefront's coordinate range, bounded Myers uses the same cutoff.
 ///
 /// # Errors
-/// Returns [`Error::InputTooLong`] if the remaining wavefront coordinates or
-/// row storage cannot be accommodated. This is not a bound miss.
+/// Returns [`Error::InputTooLong`] if the required scoring coordinates or
+/// buffers cannot be accommodated. This is not a bound miss.
 ///
 /// ```
 /// assert_eq!(bitfront::distance_at_most(b"kitten", b"sitting", 2)?, None);

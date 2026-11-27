@@ -79,6 +79,25 @@ fn bounded_flanks_cover_full_and_clipped_inline_rows() {
     }
 }
 
+#[test]
+fn bounded_flanks_can_finish_on_either_outermost_diagonal() {
+    let query: [u8; 240] = std::array::from_fn(|i| i as u8);
+    let mut reverse = query;
+    reverse.reverse();
+    for k in [31, 32, 33] {
+        let mut longer = vec![255; k];
+        longer.extend_from_slice(&query);
+        longer.extend_from_slice(&[254; 80]); // Free end after the optimal endpoint.
+        // Inserting the k leading bytes or deleting the k missing bytes is
+        // necessary and sufficient. The optimal endpoints are n+k and n-k.
+        for mut target in [longer, query[k..].to_vec()] {
+            check_anchor::<false>(&query, &target, k);
+            target.reverse();
+            check_anchor::<true>(&reverse, &target, k);
+        }
+    }
+}
+
 fn check_anchors(query: &[u8], target: &[u8]) {
     // Minimum in the last DP row includes the empty target prefix. Reverse
     // copies here, in the oracle only, make its suffix implementation simple.
@@ -127,7 +146,7 @@ fn word_boundaries_and_unequal_patterns_in_both_orders() {
 
 #[test]
 fn global_extension_after_a_gap_hits_each_word_lane_and_tail() {
-    let a: Vec<_> = (0..33).map(|i| (37 * i) as u8).collect();
+    let a: Vec<_> = (0..137).map(|i| (37 * i) as u8).collect();
     for mismatch in 0..a.len() - 1 {
         let mut b = vec![0xff];
         b.extend_from_slice(&a);
@@ -152,10 +171,10 @@ fn trim_shared_ends_without_overlap() {
     check(b"aaaa", b"aaaaaaaaa", 5);
     assert_eq!(distance_at_most(&a, &b, usize::MAX), Ok(Some(d)));
 
-    // Unequal remainders, including a partial reverse word on either side.
+    // Exercise every mismatch position within a block, on both traversal ends.
     let (x, y) = (&b"\x80"[..], &b"\x81\xfe"[..]);
-    for tail in 0..=16 {
-        let padded = |middle: &[u8]| [&flank[..3], middle, &flank[..tail]].concat();
+    for tail in 0..=129 {
+        let padded = |middle: &[u8]| [&flank[1..130 - tail], middle, &flank[..tail]].concat();
         let (a, b) = (padded(x), padded(y));
         assert_eq!(kernel::trim(&a, &b), (x, y));
         assert_eq!(kernel::trim(&b, &a), (y, x));
@@ -201,6 +220,26 @@ fn large_gap_needs_an_ordered_subsequence() {
         assert_eq!(d == long.len() - short.len(), !swapped);
         check(&short, &long, d);
         check(&long, &short, d);
+    }
+}
+
+#[test]
+fn wide_gap_with_edits_beyond_insertions() {
+    let source: Vec<u8> = (0..80).collect();
+    let target = [source.as_slice(), &[255; 97]].concat();
+    let mut deleted = vec![254];
+    deleted.extend_from_slice(&source);
+    let mut queries = vec![(deleted, 2)];
+    for extra in 1..=3 {
+        let mut query = source.clone();
+        query[..extra].fill(254);
+        queries.push((query, extra));
+    }
+    for (q, extra) in queries {
+        let d = target.len() - q.len() + extra;
+        assert_eq!(d, scalar(&q, &target));
+        assert_eq!(distance(&q, &target), Ok(d));
+        assert_eq!(distance(&target, &q), Ok(d));
     }
 }
 
@@ -384,6 +423,6 @@ fn dense_handoff_does_not_treat_a_missed_prediction_as_a_score() {
     }
     // Every nonzero byte requires one edit, and substitutions suffice.
     let d = b.iter().filter(|&&byte| byte != 0).count();
-    assert_eq!(distance(&a, &b), Ok(d));
-    assert_eq!(distance(&b, &a), Ok(d));
+    check(&a, &b, d);
+    check(&b, &a, d);
 }
