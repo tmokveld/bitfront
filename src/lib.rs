@@ -1,14 +1,28 @@
-//! Exact unit-cost Levenshtein scores on bytes. Global distance consumes both
-//! inputs; prefix and suffix distances consume the query and one anchored end
-//! of the target. No alignment path or endpoint list is constructed.
+//! Exact unit-cost Levenshtein scores and alignments on bytes. All modes consume
+//! the entire query. Global alignment consumes the entire target, prefix and
+//! suffix alignment pin one end, and infix alignment allows any contiguous
+//! target substring, including an empty one. Use [`distance`], [`prefix_distance`],
+//! [`suffix_distance`], or [`infix_distance`] for a score without constructing a
+//! path or endpoint list. [`prefix_locate`], [`suffix_locate`], and [`infix_locate`]
+//! also return one optimal target range without constructing an edit path.
 #![forbid(unsafe_code)]
 
+mod alignment;
 mod flank;
 mod kernel;
-mod word;
 
-/// Required score dimensions or buffers cannot be accommodated.
+pub use alignment::{
+    Alignment, Op, Run, align, align_at_most, infix_align, infix_align_at_most, prefix_align,
+    prefix_align_at_most, suffix_align, suffix_align_at_most,
+};
+
+/// Required alignment dimensions or buffers cannot be accommodated.
 pub use rust_edlib::AlignError as Error;
+
+pub use rust_edlib::{
+    Cigar, CigarFormat, Location, infix_distance, infix_distance_at_most, infix_locate,
+    infix_locate_at_most,
+};
 
 /// Returns the minimum number of single-byte edits transforming `a` into `b`.
 ///
@@ -23,16 +37,12 @@ pub use rust_edlib::AlignError as Error;
 /// ```
 pub fn distance(a: &[u8], b: &[u8]) -> Result<usize, Error> {
     let (a, b) = kernel::trim(a, b);
-    if a.is_empty() || b.is_empty() || (a.len() == 1 && b.len() == 1) {
-        // After trimming, two remaining single bytes necessarily differ.
-        return Ok(a.len().max(b.len()));
-    }
-    kernel::hybrid(a, b, kernel::cap(a.len(), b.len()))
+    kernel::hybrid(a, b)
 }
 
 /// Returns the exact global edit distance if it is at most `k` (inclusive).
-/// `Ok(None)` proves the distance exceeds `k`. If the trimmed inputs do not
-/// fit the wavefront's coordinate range, bounded Myers uses the same cutoff.
+/// `Ok(None)` proves the distance exceeds `k`. At the length gap, checking
+/// whether the shorter input is a subsequence decides both hits and misses.
 ///
 /// # Errors
 /// Returns [`Error::InputTooLong`] if the required scoring coordinates or
@@ -44,12 +54,12 @@ pub fn distance(a: &[u8], b: &[u8]) -> Result<usize, Error> {
 /// # Ok::<(), bitfront::Error>(())
 /// ```
 pub fn distance_at_most(a: &[u8], b: &[u8], k: usize) -> Result<Option<usize>, Error> {
-    if k == 0 {
-        return Ok((a == b).then_some(0));
-    }
-    // Trimming cannot change the length gap. Reject before scanning either end.
-    if a.len().abs_diff(b.len()) > k {
+    let gap = a.len().abs_diff(b.len());
+    if k < gap {
         return Ok(None);
+    }
+    if k == gap {
+        return rust_edlib::distance_at_most(a, b, k);
     }
     let (a, b) = kernel::trim(a, b);
     kernel::distance_at_most(a, b, k)
@@ -87,6 +97,29 @@ pub fn prefix_distance_at_most(query: &[u8], target: &[u8], k: usize) -> Result<
     flank::at_most::<false>(query, target, k, flank::CAP)
 }
 
+/// Returns the score and one optimal target prefix as a half-open range,
+/// without traceback. The range can be empty; tied ranges are not canonical.
+///
+/// # Errors
+/// Returns [`Error::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn prefix_locate(query: &[u8], target: &[u8]) -> Result<Location, Error> {
+    Ok(prefix_locate_at_most(query, target, query.len())?.expect("the empty prefix is within the bound"))
+}
+
+/// Returns one [`prefix_locate`] hit at or below `k` (inclusive), or `None` if every prefix costs more.
+///
+/// # Errors
+/// Returns [`Error::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+///
+/// ```
+/// let hit = bitfront::prefix_locate_at_most(b"ACGT", b"ATCGTzz", 1)?.unwrap();
+/// assert_eq!((hit.score, hit.target), (1, 0..5));
+/// # Ok::<(), bitfront::Error>(())
+/// ```
+pub fn prefix_locate_at_most(query: &[u8], target: &[u8], k: usize) -> Result<Option<Location>, Error> {
+    flank::locate_at_most::<false>(query, target, k)
+}
+
 /// Minimum global edit distance from the entire `query` to any suffix of
 /// `target`, including its empty suffix. The unconsumed target prefix is free.
 ///
@@ -114,6 +147,29 @@ pub fn suffix_distance(query: &[u8], target: &[u8]) -> Result<usize, Error> {
 /// ```
 pub fn suffix_distance_at_most(query: &[u8], target: &[u8], k: usize) -> Result<Option<usize>, Error> {
     flank::at_most::<true>(query, target, k, flank::CAP)
+}
+
+/// Returns the score and one optimal target suffix in forward, half-open byte
+/// coordinates, without traceback. The range can be empty; ties are not canonical.
+///
+/// # Errors
+/// Returns [`Error::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn suffix_locate(query: &[u8], target: &[u8]) -> Result<Location, Error> {
+    Ok(suffix_locate_at_most(query, target, query.len())?.expect("the empty suffix is within the bound"))
+}
+
+/// Returns one [`suffix_locate`] hit at or below `k` (inclusive), or `None` if every suffix costs more.
+///
+/// # Errors
+/// Returns [`Error::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+///
+/// ```
+/// let hit = bitfront::suffix_locate_at_most(b"TAGC", b"ACGTTAGC", 0)?.unwrap();
+/// assert_eq!((hit.score, hit.target), (0, 4..8));
+/// # Ok::<(), bitfront::Error>(())
+/// ```
+pub fn suffix_locate_at_most(query: &[u8], target: &[u8], k: usize) -> Result<Option<Location>, Error> {
+    flank::locate_at_most::<true>(query, target, k)
 }
 
 #[cfg(test)]

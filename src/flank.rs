@@ -1,9 +1,9 @@
-use crate::{Error, kernel};
+use crate::{Error, Location, kernel};
 
 // First progress check, not a hard edit limit.
 pub(crate) const CAP: usize = 16;
 
-fn trimmed_window<'q, 't, const REVERSE: bool>(
+pub(crate) fn trimmed_window<'q, 't, const REVERSE: bool>(
     query: &'q [u8], target: &'t [u8], k: usize,
 ) -> (&'q [u8], &'t [u8]) {
     let matched = kernel::matching_words::<REVERSE>(query, target);
@@ -30,23 +30,58 @@ pub(crate) fn with_cap<const REVERSE: bool>(query: &[u8], target: &[u8], cap: us
 pub(crate) fn at_most<const REVERSE: bool>(
     query: &[u8], target: &[u8], k: usize, checkpoint: usize,
 ) -> Result<Option<usize>, Error> {
-    // Excess target bytes are free; excess query bytes must be deleted.
-    if query.len().saturating_sub(target.len()) > k {
+    search::<REVERSE, _>(query, target, k, checkpoint, |score, _| score, |q, t, _| {
+        if REVERSE {
+            rust_edlib::suffix_distance_at_most(q, t, k)
+        } else {
+            rust_edlib::prefix_distance_at_most(q, t, k)
+        }
+    })
+}
+
+pub(crate) fn locate_at_most<const REVERSE: bool>(
+    query: &[u8], target: &[u8], k: usize,
+) -> Result<Option<Location>, Error> {
+    let n = target.len();
+    let location = |score, consumed| Location {
+        score,
+        target: if REVERSE { n - consumed..n } else { 0..consumed },
+    };
+    search::<REVERSE, _>(query, target, k, CAP, location, |q, t, pinned| {
+        let hit = if REVERSE {
+            rust_edlib::suffix_locate_at_most(q, t, k)
+        } else {
+            rust_edlib::prefix_locate_at_most(q, t, k)
+        }?;
+        Ok(hit.map(|h| location(h.score, pinned + h.target.len())))
+    })
+}
+
+fn search<const REVERSE: bool, T>(
+    query: &[u8], target: &[u8], k: usize, checkpoint: usize,
+    hit: impl FnOnce(usize, usize) -> T,
+    myers: impl FnOnce(&[u8], &[u8], usize) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
+    let gap = query.len().saturating_sub(target.len());
+    if gap > k {
         return Ok(None);
     }
-    let (query, target) = trimmed_window::<REVERSE>(query, target, k);
-    if query.is_empty() || target.is_empty() {
-        return Ok(Some(query.len()));
+    if gap != 0 && k == gap {
+        // A shorter span would already exceed k on length alone.
+        return Ok(rust_edlib::distance_at_most(query, target, k)?.map(|d| hit(d, target.len())));
+    }
+    let (q, t) = trimmed_window::<REVERSE>(query, target, k);
+    let pinned = query.len() - q.len();
+    if q.is_empty() || t.is_empty() {
+        return Ok(Some(hit(q.len(), pinned)));
     }
     if k == 0 {
         return Ok(None); // The first remaining bytes at the pinned end differ.
     }
-    match kernel::anchored::<REVERSE>(query, target, k, checkpoint) {
-        kernel::AnchorProbe::Hit(d) => Ok(Some(d)),
+    match kernel::anchored::<REVERSE>(q, t, k, checkpoint) {
+        kernel::AnchorProbe::Hit { score, consumed } => Ok(Some(hit(score as usize, pinned + consumed as usize))),
         kernel::AnchorProbe::Miss => Ok(None),
-        // Restart at the pinned end with the caller's cutoff, not k minus the
-        // probe cost. No particular path or endpoint was certified by the probe.
-        kernel::AnchorProbe::Myers if REVERSE => rust_edlib::suffix_distance_at_most(query, target, k),
-        kernel::AnchorProbe::Myers => rust_edlib::prefix_distance_at_most(query, target, k),
+        // A speculative probe has not certified a starting cell or spent any of the cutoff.
+        kernel::AnchorProbe::Myers => myers(q, t, pinned),
     }
 }

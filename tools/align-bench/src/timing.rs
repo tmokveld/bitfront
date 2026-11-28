@@ -5,11 +5,16 @@ use std::hint::black_box;
 use std::io;
 use std::path::Path;
 
-pub(super) type Pair = (Vec<u8>, Vec<u8>);
+pub(super) struct Pair {
+    pub query: Vec<u8>,
+    pub target: Vec<u8>,
+    pub distance: usize,
+    pub cutoff: Option<usize>,
+}
 
-pub(super) fn measure(
+pub(super) fn measure<T>(
     group: &mut BenchmarkGroup<'_, WallTime>, directory: Option<&Path>, engine: &str,
-    pairs: &[Pair], mut score: impl FnMut(&[u8], &[u8]) -> Option<usize>,
+    pairs: &[Pair], mut align: impl FnMut(&[u8], &[u8], Option<usize>) -> T,
 ) -> io::Result<()> {
     if let Some(directory) = directory {
         // Don't report last run's estimate if Criterion fails to save this one.
@@ -20,8 +25,8 @@ pub(super) fn measure(
         }
     }
     group.bench_function(engine, |b| b.iter(|| {
-        for (query, target) in pairs {
-            let _ = black_box(score(black_box(query.as_slice()), black_box(target.as_slice())));
+        for pair in pairs {
+            drop(black_box(align(black_box(pair.query.as_slice()), black_box(pair.target.as_slice()), pair.cutoff)));
         }
     }));
     Ok(())

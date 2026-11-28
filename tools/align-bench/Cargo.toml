@@ -17,10 +17,14 @@ harness = false
 [dependencies]
 bitfront = { path = "../.." }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
-rust-edlib = "=0.4.0"
+libloading = "0.9"
+rust-edlib = "0.5.1"
 rust-wfa2 = { git = "https://github.com/tmokveld/rust-wfa2", rev = "83d1b29cd06f8a7f8051b316d95ab0c5de7af073" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[build-dependencies]
+cc = "1"
 
 [profile.bench]
 lto = "thin"

@@ -1,7 +1,10 @@
 use super::{
-    distance, distance_at_most, flank, kernel, prefix_distance, prefix_distance_at_most,
-    suffix_distance, suffix_distance_at_most,
+    Location, distance, distance_at_most, flank, kernel, prefix_distance, prefix_distance_at_most,
+    prefix_locate, prefix_locate_at_most, suffix_distance, suffix_distance_at_most, suffix_locate,
+    suffix_locate_at_most,
 };
+
+mod alignment;
 
 // Wagner–Fischer prefix DP, independent of both the diagonal frontier and Myers.
 fn scalar_row(a: &[u8], b: &[u8]) -> Vec<usize> {
@@ -58,6 +61,18 @@ fn dense_flanks_keep_the_full_cutoff_after_the_probe() {
 }
 
 #[test]
+fn anchored_location_restores_the_pinned_end_after_dense_edits() {
+    let mut q = [b"pin".as_slice(), &[0; 80], &[1; 80]].concat();
+    let mut t = [b"pin".as_slice(), &[2; 80], &[1; 80], &[3; 512]].concat();
+    // Every zero needs an edit; attaining 80 requires matching every 1 in the core.
+    assert_eq!(prefix_locate(&q, &t).unwrap(), Location { score: 80, target: 0..q.len() });
+    q.reverse();
+    t.reverse();
+    assert_eq!(suffix_locate_at_most(&q, &t, 79).unwrap(), None);
+    assert_eq!(suffix_locate_at_most(&q, &t, 80).unwrap(), Some(Location { score: 80, target: t.len() - q.len()..t.len() }));
+}
+
+#[test]
 fn bounded_flanks_cover_full_and_clipped_inline_rows() {
     for d in [15, 16, 17] {
         let mut query = [b'A'; 96];
@@ -98,14 +113,30 @@ fn bounded_flanks_can_finish_on_either_outermost_diagonal() {
     }
 }
 
+fn check_anchor_row<const REVERSE: bool>(query: &[u8], target: &[u8], row: &[usize]) {
+    let d = *row.iter().min().unwrap();
+    check_anchor::<REVERSE>(query, target, d);
+    let locate = if REVERSE { suffix_locate } else { prefix_locate };
+    let bounded = if REVERSE { suffix_locate_at_most } else { prefix_locate_at_most };
+    let check = |hit: Location| {
+        let len = target.get(hit.target.clone()).unwrap().len();
+        if REVERSE { assert_eq!(hit.target.end, target.len()); } else { assert_eq!(hit.target.start, 0); }
+        assert_eq!((hit.score, row[len]), (d, d));
+    };
+    check(locate(query, target).unwrap());
+    for k in [0, d.saturating_sub(1), d, usize::MAX] {
+        let hit = bounded(query, target, k).unwrap();
+        assert_eq!(hit.is_some(), d <= k);
+        if let Some(hit) = hit { check(hit); }
+    }
+}
+
 fn check_anchors(query: &[u8], target: &[u8]) {
     // Minimum in the last DP row includes the empty target prefix. Reverse
     // copies here, in the oracle only, make its suffix implementation simple.
-    let prefix = scalar_row(query, target).into_iter().min().unwrap();
+    check_anchor_row::<false>(query, target, &scalar_row(query, target));
     let rev = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
-    let suffix = scalar_row(&rev(query), &rev(target)).into_iter().min().unwrap();
-    check_anchor::<false>(query, target, prefix);
-    check_anchor::<true>(query, target, suffix);
+    check_anchor_row::<true>(query, target, &scalar_row(&rev(query), &rev(target)));
 }
 
 #[test]
@@ -219,6 +250,10 @@ fn large_gap_needs_an_ordered_subsequence() {
         let d = scalar(&short, &long);
         assert_eq!(d == long.len() - short.len(), !swapped);
         check(&short, &long, d);
+        for k in [long.len(), usize::MAX] {
+            assert_eq!(distance_at_most(&short, &long, k), Ok(Some(d)));
+            assert_eq!(distance_at_most(&long, &short, k), Ok(Some(d)));
+        }
         check(&long, &short, d);
     }
 }
@@ -358,58 +393,6 @@ fn sparse_anchored_indels_reach_a_free_endpoint_after_the_initial_probe() {
     let suffix = [&edge, core.as_slice()].concat();
     check_anchors(&query, &prefix);
     check_anchors(&query, &suffix);
-}
-
-#[test]
-fn one_word_midpoint_can_be_at_either_query_edge() {
-    for n in [2, 31, 32, 63, 64] {
-        let query: Vec<_> = (0..n).map(|i| (199 * i) as u8).collect();
-        for extra in [n + 2, n + 3] {
-            let pad = vec![255; extra];
-            for mut target in [[&pad[..], &query].concat(), [&query[..], &pad].concat()] {
-                let pos = target.iter().position(|&b| b == query[n / 2]).unwrap();
-                target[pos] = 254;
-                let d = scalar(&query, &target);
-                assert_eq!(super::word::upper_bound(&query, &target), d);
-                assert_eq!(distance(&target, &query), Ok(d));
-            }
-        }
-    }
-}
-
-#[test]
-fn sliding_word_band_certifies_its_edges_but_not_a_large_excursion() {
-    let a: Vec<u8> = (0..265).map(|i| ((37 * i + i / 7) % 251) as u8).collect();
-    for n in [65, 72, 127, 193, 265] {
-        let a = &a[..n];
-        for gap in [0, 1, 7, 28, 55, 56] {
-            // An optimal path can spend all its slack on an excursion to
-            // either extreme diagonal, including in the partial last tile.
-            let deleted = (super::word::BAND - gap) / 2;
-            let inserted = gap + deleted;
-            for near_start in [false, true] {
-                let mut b = a.to_vec();
-                if near_start {
-                    b.drain(1..1 + deleted);
-                    b.splice(b.len() - 1..b.len() - 1, std::iter::repeat_n(255, inserted));
-                } else {
-                    b.drain(n - 1 - deleted..n - 1);
-                    b.splice(1..1, std::iter::repeat_n(255, inserted));
-                }
-                let d = scalar(a, &b);
-                assert_eq!(super::word::upper_bound(a, &b), d);
-                assert_eq!(distance(&b, a), Ok(d));
-            }
-        }
-    }
-
-    let mut b = [&a[..36], &[255; 48], &a[36..198], &a[246..]].concat();
-    b[..32].fill(254);
-    b[240..].fill(253);
-    let d = scalar(&a, &b);
-    assert!(super::word::upper_bound(&a, &b) > d);
-    assert_eq!(distance(&a, &b), Ok(d));
-    assert_eq!(distance(&b, &a), Ok(d));
 }
 
 #[test]

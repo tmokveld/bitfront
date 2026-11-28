@@ -1,6 +1,5 @@
 // Global unit-edit recurrence and forward word extension
 
-use crate::word;
 use rust_edlib::AlignError;
 
 #[inline]
@@ -61,20 +60,27 @@ pub(crate) fn matching_words<const REVERSE: bool>(a: &[u8], b: &[u8]) -> usize {
     }
 }
 
-pub(crate) fn trim<'a, 'b>(a: &'a [u8], b: &'b [u8]) -> (&'a [u8], &'b [u8]) {
+pub(crate) fn matching_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
     let prefix = common_end::<false>(a, b);
-    let (a, b) = (&a[prefix..], &b[prefix..]);
-    if a.is_empty() || b.is_empty() {
-        return (a, b);
-    }
-    let suffix = common_end::<true>(a, b);
-    (&a[..a.len() - suffix], &b[..b.len() - suffix])
+    let suffix = if prefix == a.len().min(b.len()) {
+        0
+    } else {
+        common_end::<true>(&a[prefix..], &b[prefix..])
+    };
+    (prefix, suffix)
 }
+
+pub(crate) fn trim<'a, 'b>(a: &'a [u8], b: &'b [u8]) -> (&'a [u8], &'b [u8]) {
+    let (prefix, suffix) = matching_ends(a, b);
+    (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix])
+}
+
+const SHORT_PROBE_LEN: usize = 64;
 
 /// Budget by shorter *trimmed* length.
 pub(crate) fn cap(n: usize, m: usize) -> usize {
     match n.min(m) {
-        0..=64 => 3,
+        0..=SHORT_PROBE_LEN => 3,
         65..=1024 => 16,
         _ => 64,
     }
@@ -84,38 +90,44 @@ pub(crate) fn coordinates_fit(n: usize, m: usize) -> bool {
     n.saturating_add(m) < i32::MAX as usize
 }
 
-/// Unbounded dispatch on nonempty trimmed slices. The initial budget only
-/// selects a scoring path; a projection never supplies the returned distance.
-pub(crate) fn hybrid(a: &[u8], b: &[u8], k: usize) -> Result<usize, AlignError> {
+/// Unbounded dispatch on trimmed slices. The initial budget only selects a
+/// scoring path; a projection never supplies the returned distance.
+pub(crate) fn hybrid(a: &[u8], b: &[u8]) -> Result<usize, AlignError> {
     let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    if short.len() == 1 {
-        return Ok(long.len() - usize::from(long.contains(&short[0])));
+    if short.is_empty() || long.len() == 1 {
+        // After trimming, two remaining single bytes necessarily differ.
+        return Ok(long.len());
     }
+    if short.len() == 1 {
+        return rust_edlib::distance(short, long);
+    }
+    let k = cap(short.len(), long.len());
     let gap = long.len() - short.len();
-    if gap > k && long.len() <= isize::MAX as usize / 64 {
-        if is_subsequence(short, long) {
-            return Ok(gap);
+    if gap > k {
+        // A hit at the length gap is exact; a miss rules out only gap-only scripts.
+        if let Some(d) = rust_edlib::distance_at_most(short, long, gap)? {
+            return Ok(d);
         }
         // With at least as many insertions as query bytes, a few other edits
         // can still be cheaper to certify than a multiword Myers pass.
-        if gap >= short.len() && short.len() > 64 {
+        if gap >= short.len() && short.len() > SHORT_PROBE_LEN {
             if let Some(extra) = near_subsequence(short, long) {
                 return Ok(gap + extra);
             }
         }
     }
-    if short.len() <= 64 {
+    if short.len() <= SHORT_PROBE_LEN {
         if gap <= k {
             if let Some(d) = within_three(short, long) {
                 return Ok(d);
             }
         }
-        return Ok(word::upper_bound(short, long));
+        return rust_edlib::distance(short, long);
     }
     // If one doubling could cover the gap, the first checkpoint is still a
     // useful density sample even when it cannot yet reach the endpoint.
     if gap <= 2 * k && coordinates_fit(a.len(), b.len()) {
-        if let Ok(Some(d)) = bidirectional(a, b, k) {
+        if let Some(d) = bidirectional(a, b, k)? {
             return Ok(d);
         }
     }
@@ -157,18 +169,6 @@ fn within_three(a: &[u8], b: &[u8]) -> Option<usize> {
     (two.max(span(gap - 1)) + 1 >= b.len() || span(gap + 1) >= b.len()).then_some(3)
 }
 
-fn is_subsequence(short: &[u8], mut long: &[u8]) -> bool {
-    let mut spare = long.len() - short.len();
-    for &byte in short {
-        let Some(skip) = long[..=spare].iter().position(|&b| b == byte) else {
-            return false;
-        };
-        long = &long[skip + 1..];
-        spare -= skip;
-    }
-    true
-}
-
 /// With the mandatory gap subtracted, insertions are free, substitutions cost
 /// one and deletions cost two. Keep the earliest target end for each budget:
 /// an earlier end can always skip forward, so it dominates every later end.
@@ -196,7 +196,7 @@ fn near_subsequence(short: &[u8], long: &[u8]) -> Option<usize> {
     ends.iter().position(|&p| p != miss)
 }
 
-const UNREACHABLE: i32 = -2; // Adding one to a sentinel must still be negative.
+pub(crate) const UNREACHABLE: i32 = -2; // Adding one to a sentinel must still be negative.
 const INLINE_WIDTH: usize = 2 * 16 + 1;
 
 struct Row {
@@ -244,10 +244,11 @@ fn word_at<const REVERSE: bool>(bytes: &[u8], pos: i32) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(i..i.checked_add(8)?)?.try_into().unwrap()))
 }
 
+/// Returns the consumed target length when an anchored row reaches the query end.
 #[inline]
-fn advance<const ANCHORED: bool, const REVERSE: bool>(
+pub(crate) fn advance<const ANCHORED: bool, const REVERSE: bool>(
     a: &[u8], b: &[u8], lo: i32, source: &[i32], dest: &mut [i32], mut upper: Option<&mut i32>,
-) -> bool {
+) -> Option<i32> {
     // An edit plus a mismatch in the first word advances by at most eight
     // bytes. Only the slow path can exceed this bound on the whole row.
     if let Some(bound) = upper.as_deref_mut() {
@@ -260,17 +261,17 @@ fn advance<const ANCHORED: bool, const REVERSE: bool>(
             *slot = next_offset(p[0], p[1], p[2]);
             extend_diagonal::<false, REVERSE>(a, b, z, slot, upper.as_deref_mut());
         }
-        return false;
+        return None;
     }
     for (p, slot) in source.windows(3).zip(dest.iter_mut()) {
         *slot = next_offset(p[0], p[1], p[2]);
     }
     for (z, slot) in (lo..).zip(dest) {
         if extend_diagonal::<ANCHORED, REVERSE>(a, b, z, slot, upper.as_deref_mut()) {
-            return true;
+            return Some(*slot);
         }
     }
-    false
+    None
 }
 
 // Called once per live diagonal; keep the seed in a register on the in-place path.
@@ -317,7 +318,7 @@ fn extend_diagonal<const ANCHORED: bool, const REVERSE: bool>(
     ANCHORED && *slot - z == a.len() as i32
 }
 
-struct Front {
+pub(crate) struct Front {
     rows: [Row; 2],
     odd: bool,
     lo: i32,
@@ -325,24 +326,24 @@ struct Front {
 }
 
 impl Front {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut rows = [Row::new(), Row::new()];
         rows[0].inline[2] = 0; // The caller already trimmed the matching end.
         Self { rows, odd: false, lo: 0, width: 1 }
     }
 
-    fn offsets(&self) -> &[i32] {
+    pub(crate) fn offsets(&self) -> &[i32] {
         &self.rows[self.odd as usize].stored(self.width)[2..2 + self.width]
     }
 
-    fn furthest(&self) -> i32 {
+    pub(crate) fn furthest(&self) -> i32 {
         *self.offsets().iter().max().unwrap()
     }
 
     #[inline]
     fn step<const ANCHORED: bool, const REVERSE: bool>(
         &mut self, a: &[u8], b: &[u8], lo: i32, hi: i32, upper: Option<&mut i32>,
-    ) -> Result<bool, AlignError> {
+    ) -> Result<Option<i32>, AlignError> {
         let [even, odd] = &mut self.rows;
         let (prev, curr) = if self.odd { (odd, even) } else { (even, odd) };
         let width = (hi - lo + 1) as usize;
@@ -360,12 +361,12 @@ impl Front {
     }
 
     #[inline]
-    fn expand<const ANCHORED: bool, const REVERSE: bool>(
+    pub(crate) fn expand<const REVERSE: bool>(
         &mut self, a: &[u8], b: &[u8], score: i32, upper: Option<&mut i32>,
-    ) -> Result<bool, AlignError> {
+    ) -> Result<(), AlignError> {
         let lo = -score.min(a.len() as i32);
         let hi = score.min(b.len() as i32);
-        self.step::<ANCHORED, REVERSE>(a, b, lo, hi, upper)
+        self.step::<false, REVERSE>(a, b, lo, hi, upper).map(|_| ())
     }
 }
 
@@ -374,62 +375,25 @@ impl Front {
 /// therefore certify a path costing at most the sum of the two budgets.
 /// Conversely, splitting any optimal path at these edit budgets gives an
 /// overlap. Testing successive budget sums therefore finds the minimum.
-fn overlap(f: &Front, r: &Front, end: i32, m: i32) -> bool {
+#[inline]
+pub(crate) fn meeting(f: &Front, r: &Front, end: i32, m: i32) -> Option<(i32, i32)> {
     let hi_f = f.lo + (f.width as i32 - 1);
     let hi_r = r.lo + (r.width as i32 - 1);
     let lo = f.lo.max(end - hi_r);
     let hi = hi_f.min(end - r.lo);
     if hi < lo {
-        return false;
+        return None;
     }
     let forward = &f.offsets()[(lo - f.lo) as usize..=(hi - f.lo) as usize];
     let reverse = &r.offsets()[(end - hi - r.lo) as usize..=(end - lo - r.lo) as usize];
-    forward.iter().zip(reverse.iter().rev()).any(|(&x, &y)| x >= m - y)
+    forward.iter().zip(reverse.iter().rev()).position(|(&x, &y)| x >= m - y)
+        .map(|i| (lo + i as i32, forward[i]))
 }
 
 // On dense pairs, stop spending quadratic wavefront work and switch to
 // bit-parallel Myers. Progress is sampled at doubling scores, never used
 // as a certificate or as a position from which to restart.
-const MIN_BYTES_PER_EDIT: u64 = 12;
-
-/// A one-word band can still certify the answer if we haven't ruled it out.
-/// Otherwise use frontier progress to choose a first Myers band, never a
-/// restart position. Grow a missed band rather than retrying disproved widths.
-fn finish_dense(a: &[u8], b: &[u8], score: u64, reached: u64) -> Result<Option<usize>, AlignError> {
-    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    let gap = long.len() - short.len();
-    let estimate = score * b.len() as u64 / reached.max(1);
-    let can_certify = score < word::BAND as u64 && gap <= word::BAND;
-    let first = if can_certify && estimate <= word::BAND as u64 {
-        let upper = word::upper_bound(short, long);
-        if upper <= word::BAND {
-            return Ok(Some(upper));
-        }
-        upper as u64
-    } else {
-        // Skip a full one-word pass when it is unlikely to certify the score.
-        // Shorter probes have less progress data; allow more headroom.
-        // A miss still widens the band and retries from the origin.
-        let headroom = if can_certify { estimate / 2 } else { estimate / 4 };
-        estimate + headroom
-    };
-    // A displaced or very similar middle can make either hint much too
-    // wide. Never speculate by more than a constant times the disproved budget.
-    let hint = first.min(16 * score).min(long.len() as u64) as usize;
-    if hint <= gap + 64 {
-        // The ordinary score-only call already starts with at least this band.
-        return Ok(None);
-    }
-    let mut slack = hint - gap;
-    loop {
-        if let Some(d) = rust_edlib::distance_at_most(short, long, gap + slack)? {
-            return Ok(Some(d));
-        }
-        // At slack == short.len(), deleting/substituting/inserting always
-        // fits the longer length, so the bounded call succeeds by then.
-        slack = (2 * slack).min(short.len());
-    }
-}
+pub(crate) const MIN_BYTES_PER_EDIT: u64 = 12;
 
 fn bidirectional(a: &[u8], b: &[u8], mut checkpoint: usize) -> Result<Option<usize>, AlignError> {
     // Both matching ends have already been removed by trim.
@@ -437,35 +401,44 @@ fn bidirectional(a: &[u8], b: &[u8], mut checkpoint: usize) -> Result<Option<usi
     let (mut left, mut right) = (0, 0);
     let m = b.len() as i32;
     let end = m - a.len() as i32;
-    // At d <= BAND, projected wavefront work d²/2 can only exceed a
-    // two-cells-per-byte scan for targets shorter than BAND²/4. Sample these
-    // early for a one-word certificate, not for a speculative wide restart.
-    let first_wide = checkpoint;
-    if b.len() < word::BAND * word::BAND / 4 {
+    // Sample again halfway to the usual checkpoint on short cores, where
+    // quadratic frontier work can already cost more than a linear scan.
+    let first_checkpoint = checkpoint;
+    if b.len() < INLINE_WIDTH * INLINE_WIDTH {
         checkpoint /= 2;
     }
     for score in 1..=a.len().max(b.len()) {
-        if score % 2 == 1 {
-            f.expand::<false, false>(a, b, (score / 2 + 1) as i32, Some(&mut left))?;
+        let step = if score % 2 == 1 {
+            f.expand::<false>(a, b, (score / 2 + 1) as i32, Some(&mut left))
         } else {
-            r.expand::<false, true>(a, b, (score / 2) as i32, Some(&mut right))?;
+            r.expand::<true>(a, b, (score / 2) as i32, Some(&mut right))
+        };
+        if step.is_err() {
+            return Ok(None); // A frontier allocation failed; Myers uses different storage.
         }
-        if left >= m - right && overlap(&f, &r, end, m) {
+        if left >= m - right && meeting(&f, &r, end, m).is_some() {
             return Ok(Some(score));
         }
         if score == checkpoint {
             checkpoint *= 2;
             let s = score as u64;
-            let consider_wide = score >= first_wide;
             let reached = f.furthest() as u64 + r.furthest() as u64;
-            if reached < s * MIN_BYTES_PER_EDIT
-                && (consider_wide || s * m as u64 <= word::BAND as u64 * reached)
-            {
-                // On short pairs a few more wavefront rows can be cheaper
-                // than even a linear word-band pass. Compare projected d²/2
-                // with two cells per byte, where d ≈ s*m/reached.
+            if reached < s * MIN_BYTES_PER_EDIT {
+                let estimate = (s * m as u64 / reached.max(1)).max(s + 1);
+                // Don't make a long-range prediction from the early half sample.
+                if score < first_checkpoint && estimate > 4 * first_checkpoint as u64 {
+                    continue;
+                }
+                // Projected frontier work is about d²/2. Let a cheap inline
+                // frontier continue while that is cheaper than scanning the inputs.
                 if score >= INLINE_WIDTH || s * s * m as u64 > 4 * reached * reached {
-                    return finish_dense(a, b, s, reached);
+                    // The estimate sets the first score budget, never the
+                    // restart position. Add headroom to larger estimates but
+                    // don't speculate far past the last disproved score.
+                    let headroom = if score < INLINE_WIDTH { 0 } else { estimate / 4 };
+                    let hint = (estimate + headroom).min(16 * s).min(a.len().max(b.len()) as u64);
+                    drop((f, r));
+                    return rust_edlib::distance_with_hint(a, b, hint as usize).map(Some);
                 }
             }
         }
@@ -474,7 +447,7 @@ fn bidirectional(a: &[u8], b: &[u8], mut checkpoint: usize) -> Result<Option<usi
 }
 
 pub(crate) enum AnchorProbe {
-    Hit(usize),
+    Hit { score: i32, consumed: i32 },
     Miss,
     Myers,
 }
@@ -500,7 +473,7 @@ fn anchored_inline<const REVERSE: bool, const WIDTH: usize>(
             *slot = next_offset(left, center, right);
             (left, center) = (center, right);
             if extend_diagonal::<true, REVERSE>(a, b, z, slot, None) {
-                return AnchorProbe::Hit(score as usize);
+                return AnchorProbe::Hit { score, consumed: *slot };
             }
         }
     }
@@ -547,8 +520,8 @@ pub(crate) fn anchored<const REVERSE: bool>(
             // Every endpoint has z <= end; each remaining edit can reduce z by at most one.
             let hi = score.min(end + (limit - score));
             match front.step::<true, REVERSE>(a, b, -score, hi, None) {
-                Ok(true) => return AnchorProbe::Hit(score as usize),
-                Ok(false) => {}
+                Ok(Some(h)) => return AnchorProbe::Hit { score, consumed: h },
+                Ok(None) => {}
                 Err(_) => return AnchorProbe::Myers, // Myers has independent storage.
             }
         }
@@ -563,36 +536,63 @@ pub(crate) fn anchored<const REVERSE: bool>(
     }
 }
 
-/// Global probe on remainders with both common ends removed.
-pub(crate) fn distance_at_most(a: &[u8], b: &[u8], k: usize) -> Result<Option<usize>, AlignError> {
-    let gap = a.len().abs_diff(b.len());
-    if gap > k {
-        return Ok(None);
+// Reserve early handoffs for large near-balanced cores, away from a narrow
+// length-gap cone. A vacuous cutoff keeps the existing unbounded-cost policy.
+pub(crate) fn wide_cutoff(n: usize, m: usize, k: usize) -> bool {
+    let short = n.min(m);
+    let gap = n.abs_diff(m);
+    short >= 1024 && k >= 128 && k < n.max(m) && gap <= short / 4
+        && k.saturating_sub(gap) >= 64 && k >= short.div_ceil(32)
+}
+
+// A concrete script can disprove the projection, not the cutoff. Dense ends
+// around an easy middle otherwise trigger an expensive early restart. Check
+// whether diagonal substitutions plus the trailing gap cost at most half the
+// projected score. Both callers already verified that coordinates fit in i32.
+pub(crate) fn uneven_progress(a: &[u8], b: &[u8], score: u64, reached: u64) -> bool {
+    let half = score * b.len() as u64 / (2 * reached.max(1));
+    if half >= a.len().max(b.len()) as u64 {
+        return true;
     }
-    if a.is_empty() || b.is_empty() {
-        return Ok(Some(gap));
+    let Some(mut budget) = (half as usize).checked_sub(a.len().abs_diff(b.len())) else { return false };
+    for (x, y) in a.chunks(64).zip(b.chunks(64)) {
+        let changed = x.iter().zip(y).filter(|(x, y)| x != y).count();
+        if changed > budget {
+            return false;
+        }
+        budget -= changed;
+    }
+    true
+}
+
+/// Global probe on trimmed remainders whose length gap is strictly below `k`.
+pub(crate) fn distance_at_most(a: &[u8], b: &[u8], k: usize) -> Result<Option<usize>, AlignError> {
+    debug_assert!(a.len().abs_diff(b.len()) < k);
+    if k >= a.len().max(b.len()) {
+        // Even substituting every shared position and paying the gap fits.
+        return hybrid(a, b).map(Some);
     }
     if !coordinates_fit(a.len(), b.len()) {
         return rust_edlib::distance_at_most(a, b, k);
     }
-    let upper = a.len().max(b.len());
-    if k < upper {
-        bounded::<true>(a, b, k as i32)
-    } else {
-        bounded::<false>(a, b, upper as i32)
-    }
+    bounded(a, b, k as i32)
 }
 
-fn bounded<const NARROW: bool>(a: &[u8], b: &[u8], limit: i32) -> Result<Option<usize>, AlignError> {
+fn bounded(a: &[u8], b: &[u8], limit: i32) -> Result<Option<usize>, AlignError> {
     let (n, m) = (a.len() as i32, b.len() as i32);
     let end = m - n;
+    let mut wide = wide_cutoff(a.len(), b.len(), limit as usize);
+    let mut diagonal = None;
     let mut front = Front::new();
     // Before this score, |z| <= score implies |z - end| <= limit - score.
-    let full_through = if NARROW { (limit - end.abs()) / 2 } else { limit };
-    let mut checkpoint: i32 = 64;
+    let full_through = (limit - end.abs()) / 2;
+    // A loose cutoff says nothing about the true distance. Finish cheap hits
+    // in the inline frontier before paying for any whole-input certificate.
+    const INLINE_SCORE: i32 = (INLINE_WIDTH / 2) as i32;
+    let mut checkpoint = if wide { INLINE_SCORE } else { 64 };
     for score in 1..=limit {
         let (mut lo, mut hi) = (-score.min(n), score.min(m));
-        if NARROW && score > full_through {
+        if score > full_through {
             // Each remaining edit can change the diagonal by at most one.
             // Compute in i64: end +/- remaining can exceed i32 even when the
             // coordinates fit. Intersecting with the row before casting fits.
@@ -600,22 +600,42 @@ fn bounded<const NARROW: bool>(a: &[u8], b: &[u8], limit: i32) -> Result<Option<
             lo = i64::from(lo).max(i64::from(end) - remaining) as i32;
             hi = i64::from(hi).min(i64::from(end) + remaining) as i32;
         }
-        front.step::<false, false>(a, b, lo, hi, None)?;
+        let _ = front.step::<false, false>(a, b, lo, hi, None)?;
         if (lo..=hi).contains(&end) && front.offsets()[(end - lo) as usize] == m {
             return Ok(Some(score as usize));
         }
         if score == checkpoint {
+            if score == INLINE_SCORE && n == m {
+                let probe = rust_edlib::GlobalProbe::new(a, b);
+                if let Some(d) = probe.diagonal_score() {
+                    return Ok((d <= limit as usize).then_some(d));
+                }
+                diagonal = Some(probe);
+            }
             checkpoint = checkpoint.saturating_mul(2);
-            // Keep tight cutoffs on the wavefront. For a wider cutoff, compare
-            // the current diagonal work with a Myers pass over the whole band.
-            let blocks = (limit.min(n).min(m) as u64).div_ceil(u64::BITS.into());
-            if checkpoint <= limit
-                && score as u64 * front.width as u64 >= blocks * n.max(m) as u64
-                && (front.furthest() as u64) < score as u64 * MIN_BYTES_PER_EDIT
-            {
-                drop(front);
-                // Restart from the origin with the full cutoff, not the unused edits.
-                return rust_edlib::distance_at_most(a, b, limit as usize);
+            if checkpoint <= limit {
+                let s = score as u64;
+                // Compare frontier work to the estimated cost of a dense
+                // scan. This scale is a switch heuristic, not a band size.
+                const DENSE_SCAN_RATE: u64 = 64;
+                let scan = (limit.min(n).min(m) as u64).div_ceil(DENSE_SCAN_RATE)
+                    * n.max(m) as u64;
+                let expensive = s * front.width as u64 >= scan;
+                if wide || expensive {
+                    let reached = front.furthest() as u64;
+                    if reached < s * MIN_BYTES_PER_EDIT {
+                        let near = wide && reached * (limit - limit / 4) as u64 <= s * m as u64;
+                        if expensive || (near && !uneven_progress(a, b, s, reached)) {
+                            drop(front);
+                            let k = limit as usize;
+                            return match diagonal {
+                                Some(probe) => probe.distance_at_most(k),
+                                None => rust_edlib::distance_at_most(a, b, k),
+                            };
+                        }
+                        if near { wide = false; } // Don't rescan after disproving the sample.
+                    }
+                }
             }
         }
     }

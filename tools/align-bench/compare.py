@@ -9,7 +9,13 @@ import tempfile
 
 BENCH = Path(__file__).resolve().parent
 ROOT = BENCH.parents[1]
-USAGE = "Usage: run.sh --compare REV [--samples N] [--smoke | --case MODE SOURCE_BP RATE_BP [CUTOFF]]"
+USAGE = (
+    "Usage: run.sh --compare REV [--task score] [--samples N] "
+    "[--smoke | --case NAME | --case MODE TEMPLATE_BP RATE_BP [CUTOFF] [--flank BP] [--swap]]\n"
+    "  Named cases: mixed-below, mixed-at, sparse-loose.\n"
+    "  --flank BP adds trailing target bases; --swap exchanges the generated query and target.\n"
+    "  Both flags apply only to a custom global --case and can precede or follow it."
+)
 
 
 def main(args):

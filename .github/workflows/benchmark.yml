@@ -10,6 +10,19 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      CC: "false"
+      CXX: "false"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - run: cargo +1.85.0 test --locked
+      - run: cargo +1.85.0 test --locked --release
+
   compare:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -21,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang cmake libclang-dev pkg-config
-      - name: Compare exact edit scores
+      - name: Compare exact scores and traceback paths
         shell: bash
         run: |
           rustc -Vv

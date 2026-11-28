@@ -76,7 +76,9 @@ name = "bitfront-bench"
 version = "0.0.0"
 dependencies = [
  "bitfront",
+ "cc",
  "criterion",
+ "libloading 0.9.1",
  "rust-edlib",
  "rust-wfa2",
  "serde",
@@ -149,7 +151,7 @@ checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -286,6 +288,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -397,9 +409,9 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "rust-edlib"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e90aece904ed25fd9a7d56b9ce1f7ceddf91ee9221995b520a51100361b7cf4e"
+checksum = "8da82d01e3c3229d898c8669fda5ec87a71e0f1ce927a6945f05519f9616763c"
 
 [[package]]
 name = "rust-wfa2"
